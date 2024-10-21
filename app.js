@@ -12,13 +12,16 @@ app.use(bodyParser.json());
 app.get("/inv", async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT inv.invoice_id, bf.street_address, bf.city, bf.post_code, bf.country,
-             inv.invoice_date, inv.payment_terms, inv.project_description,
-             c.clients_name, c.clients_email, c.clients_street_address, 
-             c.clients_city, c.clients_post_code, c.clients_country
-      FROM bill_from bf
-      INNER JOIN invoice inv ON bf.bill_from_id = inv.invoice_id
-      INNER JOIN clients c ON inv.invoice_id = c.clients_id
+   SELECT inv.id, bf.street_address, bf.city, bf.post_code, bf.country,
+          inv.invoice_date, inv.payment_terms, inv.project_description, 
+			    inv.invoice_status,
+          c.clients_name, c.clients_email, c.clients_street_address, 
+          c.clients_city, c.clients_post_code, c.clients_country,
+			 i.item_name, i.quantity, i.price
+      FROM invoice inv
+      INNER JOIN bill_from bf ON inv.id = bf.bill_from_id
+      INNER JOIN clients c ON inv.id = c.clients_id
+	    INNER JOIN items i ON inv.id = i.invoice_id ORDER BY id ASC
     `);
     res.json(result.rows);
   } catch (err) {
@@ -27,40 +30,30 @@ app.get("/inv", async (req, res) => {
   }
 });
 
-app.get("/inv/items", async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT item_id, item_name, quantity, price FROM items`
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error("Error retrieving items list:", err);
-    res.status(500).send("Error retrieving items list");
-  }
-});
-
 app.post("/inv", async (req, res) => {
   const newInv = req.body;
   const invId = uuid();
-
+  console.log(newInv);
   try {
     await pool.query("BEGIN");
 
     const invoiceResult = await pool.query(
-      `INSERT INTO invoice (invoice_id, invoice_date, payment_terms, project_description) 
-       VALUES ($1, $2, $3, $4) RETURNING invoice_id`,
+      `INSERT INTO invoice (id, invoice_date, invoice_status, payment_terms, project_description) 
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
       [
         invId,
         newInv.invoiceDate,
+        newInv.invoiceStatus,
         newInv.paymentTerms,
         newInv.projectDescription,
       ]
     );
+
     await pool.query(
-      `INSERT INTO bill_from (street_address, city, post_code, country) 
-       VALUES ($1, $2, $3, $4)`,
+      `INSERT INTO bill_from (bill_from_id, street_address, city, post_code, country) 
+       VALUES ($1, $2, $3, $4, $5)`,
       [
-        billFromId,
+        invId,
         newInv.streetAddress,
         newInv.city,
         newInv.postCode,
@@ -68,10 +61,10 @@ app.post("/inv", async (req, res) => {
       ]
     );
     await pool.query(
-      `INSERT INTO clients (clients_name, clients_email, clients_street_address, clients_city, clients_post_code, clients_country) 
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+      `INSERT INTO clients (clients_id, clients_name, clients_email, clients_street_address, clients_city, clients_post_code, clients_country) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [
-        clientId,
+        invId,
         newInv.clientsName,
         newInv.clientsEmail,
         newInv.clientsStreetAddress,
@@ -80,49 +73,57 @@ app.post("/inv", async (req, res) => {
         newInv.clientsCountry,
       ]
     );
-    await pool.query(
-      `INSERT INTO items (item_name, quantity, price) 
-       VALUES ($1, $2, $3)`,
-      [itemId, newInv.itemName, newInv.quantity, newInv.price]
-    );
+
+    try {
+      await Promise.all(
+        req.body.items.map(async (row) => {
+          await pool.query(
+            `INSERT INTO items (item_name, quantity, price, invoice_id) 
+         VALUES ($1, $2, $3, $4)`,
+            [row.itemName, row.quantity, row.price, invId]
+          );
+        })
+      );
+    } catch (err) {
+      console.error(err);
+    }
 
     await pool.query("COMMIT");
     res.status(201).json({
       success: true,
-      message: "Invoice, bill from, clients, and items created successfully",
-      invoiceId: invoiceResult.rows[0].invoice_id,
+      message: "Invoice, bill_from, clients, and items created successfully",
+      invoiceId: invoiceResult.rows[0].id,
     });
   } catch (err) {
     await pool.query("ROLLBACK");
     console.error(err);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error adding invoice and related data",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error adding invoice and related data",
+    });
   }
 });
 
 app.put("/inv/:id", async (req, res) => {
   const { id } = req.params;
   const newData = req.body;
-
+  console.log(newData);
   try {
     await pool.query("BEGIN");
 
     // Fetch current data from the database for the invoice
     const existingInvoice = await pool.query(
-      `SELECT invoice_date, payment_terms, project_description 
-       FROM invoice WHERE invoice_id = $1`,
+      `SELECT invoice_date, invoice_status, payment_terms, project_description 
+       FROM invoice WHERE id = $1`,
       [id]
     );
-    console.log(existingInvoice.rows[0]);
+
     const currentInvoiceData = existingInvoice.rows[0];
 
     // Merge existing data with new data, so we only update fields that are provided
     const mergedInvoiceData = {
       invoiceDate: newData.invoiceDate || currentInvoiceData.invoice_date,
+      invoiceStatus: newData.invoiceStatus || currentInvoiceData.invoice_status,
       paymentTerms: newData.paymentTerms || currentInvoiceData.payment_terms,
       projectDescription:
         newData.projectDescription || currentInvoiceData.project_description,
@@ -131,10 +132,11 @@ app.put("/inv/:id", async (req, res) => {
     // Update the invoice table with the merged data
     await pool.query(
       `UPDATE invoice 
-       SET invoice_date = $1, payment_terms = $2, project_description = $3
-       WHERE invoice_id = $4`,
+       SET invoice_date = $1, invoice_status = $2, payment_terms = $3, project_description = $4
+       WHERE id = $5`,
       [
         mergedInvoiceData.invoiceDate,
+        mergedInvoiceData.invoiceStatus,
         mergedInvoiceData.paymentTerms,
         mergedInvoiceData.projectDescription,
         id,
@@ -176,7 +178,7 @@ app.put("/inv/:id", async (req, res) => {
     // Fetch existing clients data
     const existingClients = await pool.query(
       `SELECT clients_name, clients_email, clients_street_address, clients_city, clients_post_code, clients_country 
-       FROM clients WHERE clients_id = (SELECT clients_id FROM invoice WHERE invoice_id = $1)`,
+       FROM clients WHERE clients_id = $1`,
       [id]
     );
 
@@ -201,7 +203,7 @@ app.put("/inv/:id", async (req, res) => {
       `UPDATE clients
        SET clients_name = $1, clients_email = $2, clients_street_address = $3,
            clients_city = $4, clients_post_code = $5, clients_country = $6
-       WHERE clients_id = (SELECT clients_id FROM invoice WHERE invoice_id = $7)`,
+       WHERE clients_id = $7`,
       [
         mergedClientsData.clientsName,
         mergedClientsData.clientsEmail,
@@ -215,30 +217,35 @@ app.put("/inv/:id", async (req, res) => {
 
     // Fetch existing items data
     const existingItems = await pool.query(
-      `SELECT item_name, quantity, price FROM items WHERE item_id = $1`,
+      `SELECT item_name, quantity, price FROM items WHERE invoice_id = $1`,
       [id]
     );
 
-    const currentItemsData = existingItems.rows[0];
+    // Iterate through each item in the request body
+    await Promise.all(
+      req.body.items.map(async (row, index) => {
+        const currentItemsData = existingItems.rows[index];
 
-    // Merge items data with new data
-    const mergedItemsData = {
-      itemName: newData.itemName || currentItemsData.item_name,
-      quantity: newData.quantity || currentItemsData.quantity,
-      price: newData.price || currentItemsData.price,
-    };
+        // Merge items data with new data
+        const mergedItemsData = {
+          itemName: row.itemName || currentItemsData.item_name,
+          quantity: row.quantity || currentItemsData.quantity,
+          price: row.price || currentItemsData.price,
+        };
 
-    // Update the items table
-    await pool.query(
-      `UPDATE items
-       SET item_name = $1, quantity = $2, price = $3
-       WHERE item_id = $4`,
-      [
-        mergedItemsData.itemName,
-        mergedItemsData.quantity,
-        mergedItemsData.price,
-        id,
-      ]
+        // Update the items table
+        await pool.query(
+          `UPDATE items
+         SET item_name = $1, quantity = $2, price = $3
+         WHERE invoice_id = $4`,
+          [
+            mergedItemsData.itemName,
+            mergedItemsData.quantity,
+            mergedItemsData.price,
+            id,
+          ]
+        );
+      })
     );
 
     await pool.query("COMMIT");
@@ -253,6 +260,33 @@ app.put("/inv/:id", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error updating invoice and related data",
+    });
+  }
+});
+
+app.delete("/inv/:id", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await pool.query("BEGIN");
+
+    await pool.query(`DELETE FROM items WHERE invoice_id = $1`, [id]);
+    await pool.query(`DELETE FROM clients WHERE clients_id = $1`, [id]);
+    await pool.query(`DELETE FROM bill_from WHERE bill_from_id = $1`, [id]);
+    await pool.query(`DELETE FROM invoice WHERE id = $1`, [id]);
+
+    await pool.query("COMMIT");
+
+    res.status(200).json({
+      success: true,
+      message: "Invoice and related data deleted successfully",
+    });
+  } catch (err) {
+    await pool.query("ROLLBACK");
+    console.error("Error deleting invoice:", err);
+    res.status(500).json({
+      success: false,
+      message: "Error deleting invoice and related data",
     });
   }
 });
