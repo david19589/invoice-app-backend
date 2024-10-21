@@ -74,19 +74,15 @@ app.post("/inv", async (req, res) => {
       ]
     );
 
-    try {
-      await Promise.all(
-        req.body.items.map(async (row) => {
-          await pool.query(
-            `INSERT INTO items (item_name, quantity, price, invoice_id) 
-         VALUES ($1, $2, $3, $4)`,
-            [row.itemName, row.quantity, row.price, invId]
-          );
-        })
-      );
-    } catch (err) {
-      console.error(err);
-    }
+    await Promise.all(
+      req.body.items.map(async (row) => {
+        await pool.query(
+          `INSERT INTO items (item_name, quantity, price, invoice_id) 
+           VALUES ($1, $2, $3, $4)`,
+          [row.itemName, row.quantity, row.price, invId]
+        );
+      })
+    );
 
     await pool.query("COMMIT");
     res.status(201).json({
